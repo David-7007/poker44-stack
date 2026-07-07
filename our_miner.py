@@ -39,6 +39,12 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"Loading stack artifact: {MODEL_PATH}")
         self.predictor = StackPredictor(MODEL_PATH)
         bt.logging.info(f"Artifact metadata: {self.predictor.metadata}")
+        # Warm CUDA/JIT so the first validator query is as fast as steady state
+        # (validator-reported latency feeds the aggregated score).
+        t0 = time.time()
+        warmup_hand = {"metadata": {}, "players": [], "streets": [], "actions": [], "outcome": {}}
+        self.predictor.predict_chunk_scores([[warmup_hand]] * 4)
+        bt.logging.info(f"Inference warmup done in {time.time()-t0:.2f}s")
 
         repo_root = Path(__file__).resolve().parents[1]
         impl_files = [
