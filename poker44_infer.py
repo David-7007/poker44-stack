@@ -95,6 +95,13 @@ class StackPredictor:
         except Exception:
             return None
 
+    # Absolute-probability confidence needed for a chunk to cross the 0.5
+    # operational threshold. The 2026-07-08 validator formula zeroes the
+    # reward if no true bot scores >= 0.5 and decays it when hard FPR@0.5
+    # exceeds 10%, so only high-confidence chunks may cross while the
+    # ranking (AP / recall@FPR) stays intact.
+    CROSS_CONFIDENCE = 0.80
+
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
             return []
@@ -108,8 +115,21 @@ class StackPredictor:
             if not components:
                 return [0.5] * len(chunks)
             ranked = np.mean([_rank(c) for c in components], axis=0)
-            # squash into (0.02, 0.98) so scores stay strictly inside [0,1]
-            final = 0.02 + 0.96 * ranked
+            mean_prob = np.mean(components, axis=0)
+
+            # K = chunks confident enough to cross 0.5; crossing set is the
+            # top-K by rank so ordering is preserved exactly. Always cross at
+            # least the strongest chunk: zero hard positives => zero reward.
+            k = max(1, int(np.sum(mean_prob >= self.CROSS_CONFIDENCE)))
+            k = min(k, len(chunks))
+            order = np.argsort(-ranked, kind="stable")
+            final = np.empty(len(chunks))
+            n_low = max(len(chunks) - k, 1)
+            for pos, idx in enumerate(order):
+                if pos < k:  # confident bots: 0.98 down to 0.55, monotone
+                    final[idx] = 0.98 - (0.43 * pos / max(k, 1))
+                else:  # everything else: 0.45 down to 0.02, monotone
+                    final[idx] = 0.45 - (0.43 * (pos - k) / n_low)
             return [float(round(s, 6)) for s in final]
         except Exception:
             return [0.5] * len(chunks)
