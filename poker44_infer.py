@@ -72,7 +72,12 @@ class StackPredictor:
             amask = np.zeros((B, MAX_HANDS, MAX_ACTIONS), dtype=bool)
             hmask = np.zeros((B, MAX_HANDS), dtype=bool)
             for i, chunk in enumerate(chunks):
-                hands = [h for h in chunk if isinstance(h, dict)][:MAX_HANDS]
+                hands = [h for h in chunk if isinstance(h, dict)]
+                if len(hands) > MAX_HANDS:
+                    # live chunks carry ~80 hands vs 30-40 in training: take an
+                    # even spread so the set size matches the trained regime.
+                    step = len(hands) / MAX_HANDS
+                    hands = [hands[int(j * step)] for j in range(MAX_HANDS)]
                 for j, hand in enumerate(hands):
                     t, am, sc = encode_hand(hand)
                     tokens[i, j], amask[i, j], scal[i, j] = t, am, sc
