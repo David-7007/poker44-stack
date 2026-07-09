@@ -101,6 +101,11 @@ class StackPredictor:
     # exceeds 10%, so only high-confidence chunks may cross while the
     # ranking (AP / recall@FPR) stays intact.
     CROSS_CONFIDENCE = 0.80
+    # Floor on the crossing set: live-domain confidence collapses (measured
+    # 2026-07-09: 1/100 live chunks >= 0.80), and a window with zero true-bot
+    # hard positives scores 0 reward. The top 12% by rank are overwhelmingly
+    # bots for any usable ranking, keeping hard-FPR well under the 10% cliff.
+    GATE_MIN_FRACTION = 0.12
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
@@ -120,7 +125,12 @@ class StackPredictor:
             # K = chunks confident enough to cross 0.5; crossing set is the
             # top-K by rank so ordering is preserved exactly. Always cross at
             # least the strongest chunk: zero hard positives => zero reward.
-            k = max(1, int(np.sum(mean_prob >= self.CROSS_CONFIDENCE)))
+            import math
+            k = max(
+                1,
+                int(np.sum(mean_prob >= self.CROSS_CONFIDENCE)),
+                math.ceil(self.GATE_MIN_FRACTION * len(chunks)),
+            )
             k = min(k, len(chunks))
             order = np.argsort(-ranked, kind="stable")
             final = np.empty(len(chunks))
