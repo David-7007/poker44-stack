@@ -25,6 +25,7 @@ from poker44.utils.model_manifest import (
 from poker44.validator.synapse import DetectionSynapse
 
 from poker44_infer import StackPredictor  # noqa: E402  (from SRC_DIR)
+import live_capture  # noqa: E402  (from SRC_DIR; no-op unless POKER44_CAPTURE=1)
 
 MODEL_PATH = os.getenv("POKER44_MODEL_PATH", "/root/poker44/models/poker44_stack_v1.joblib")
 MODEL_NAME = os.getenv("POKER44_MODEL_NAME", "poker44-stack")
@@ -104,6 +105,11 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(
             f"Scored {len(chunks)} chunks in {time.time()-t0:.1f}s "
             f"(caller={getattr(synapse.dendrite, 'hotkey', '?')})"
+        )
+        # local-only, fail-safe capture of the live eval distribution
+        await asyncio.to_thread(
+            live_capture.capture, chunks, scores,
+            getattr(synapse.dendrite, "hotkey", ""),
         )
         return synapse
 

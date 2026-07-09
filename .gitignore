@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 wandb/
 .venv*/
+
+# local live-capture output
+live_capture/
