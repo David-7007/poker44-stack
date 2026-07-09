@@ -30,10 +30,19 @@ def _rank(x: np.ndarray) -> np.ndarray:
 class StackPredictor:
     def __init__(self, artifact_path: str | Path, device: str | None = None):
         art = joblib.load(artifact_path)
-        assert art.get("schema") == "poker44-stack-v1", "unknown artifact schema"
+        self.schema = art.get("schema")
+        assert self.schema in ("poker44-stack-v1", "poker44-blend-v5"), "unknown artifact schema"
         self.feature_names = art["feature_names"]
-        self.models = art["models"]
         self.metadata = art.get("metadata", {})
+        if self.schema == "poker44-blend-v5":
+            self.stack_models = art["stack_models"]
+            self.mono_model = art["mono_model"]
+            self.mono_cols = np.asarray(art["mono_cols"], dtype=int)
+            self.mlp_model = art["mlp_model"]
+            self.blend_weights = art["blend_weights"]
+            self.models = {}
+        else:
+            self.models = art["models"]
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.seq_models = []
         d = art.get("seq_arch", {}).get("d", 96)
@@ -54,6 +63,22 @@ class StackPredictor:
                                  dtype=np.float32)
             rows.append(vec)
         X = np.vstack(rows)
+        if self.schema == "poker44-blend-v5":
+            out = {}
+            try:
+                out["stack"] = np.mean(
+                    [m.predict_proba(X)[:, 1] for m in self.stack_models], axis=0)
+            except Exception:
+                pass
+            try:
+                out["mono"] = self.mono_model.predict_proba(X[:, self.mono_cols])[:, 1]
+            except Exception:
+                pass
+            try:
+                out["mlp"] = self.mlp_model.predict_proba(X)[:, 1]
+            except Exception:
+                pass
+            return out
         out = {}
         for name, model in self.models.items():
             try:
@@ -116,16 +141,23 @@ class StackPredictor:
         if not chunks:
             return []
         try:
-            components: list[np.ndarray] = []
             feats = self._feature_scores(chunks)
-            components.extend(feats.values())
             seq = self._seq_scores(chunks)
             if seq is not None:
-                components.append(seq)
-            if not components:
+                feats["seq"] = seq
+            if not feats:
                 return [0.5] * len(chunks)
-            ranked = np.mean([_rank(c) for c in components], axis=0)
-            mean_prob = np.mean(components, axis=0)
+            if self.schema == "poker44-blend-v5":
+                weights = {k: float(self.blend_weights.get(k, 0.0)) for k in feats}
+                if sum(weights.values()) <= 0:
+                    weights = {k: 1.0 for k in feats}
+                total = sum(weights.values())
+                ranked = sum(w * _rank(feats[k]) for k, w in weights.items()) / total
+                mean_prob = sum(w * feats[k] for k, w in weights.items()) / total
+            else:
+                components = list(feats.values())
+                ranked = np.mean([_rank(c) for c in components], axis=0)
+                mean_prob = np.mean(components, axis=0)
 
             # K = chunks confident enough to cross 0.5; crossing set is the
             # top-K by rank so ordering is preserved exactly. Always cross at
