@@ -47,16 +47,20 @@ def _entropy(counter: Counter) -> float:
 
 
 def _stats(values: list[float], prefix: str) -> dict[str, float]:
+    stat_names = ("mean", "std", "min", "max", "q10", "q25", "q50", "q75", "q90")
     if not values:
-        return {f"{prefix}_{s}": 0.0 for s in ("mean", "std", "min", "max", "q25", "q75")}
+        return {f"{prefix}_{s}": 0.0 for s in stat_names}
     arr = np.asarray(values, dtype=float)
     return {
         f"{prefix}_mean": float(arr.mean()),
         f"{prefix}_std": float(arr.std()),
         f"{prefix}_min": float(arr.min()),
         f"{prefix}_max": float(arr.max()),
+        f"{prefix}_q10": float(np.quantile(arr, 0.10)),
         f"{prefix}_q25": float(np.quantile(arr, 0.25)),
+        f"{prefix}_q50": float(np.quantile(arr, 0.50)),
         f"{prefix}_q75": float(np.quantile(arr, 0.75)),
+        f"{prefix}_q90": float(np.quantile(arr, 0.90)),
     }
 
 
@@ -156,6 +160,98 @@ def group_features(hands: list[dict]) -> dict[str, float]:
     out["grp_street_entropy"] = _entropy(all_streets)
     out["grp_seat_entropy"] = _entropy(seat_counter)
     out.update(_ngram_features(hands))
+    out.update(_signature_features(hands))
+    return out
+
+
+# ---- bot-regularity / cross-hand-signature families -----------------------
+# Bots replay near-identical action/sizing sequences across hands; humans do
+# not. These families (adapted from the leading open miners) capture that tell
+# directly and tend to survive the synthetic->real-bot distribution gap.
+_BB_EDGES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0,
+             36.0, 56.0, 84.0, 126.0]
+
+
+def _bucket_idx(bb: float) -> int:
+    for i, e in enumerate(_BB_EDGES):
+        if bb <= e + 1e-9:
+            return i
+    return len(_BB_EDGES)
+
+
+def _max_run_share(seq: list) -> float:
+    if not seq:
+        return 0.0
+    best = run = 1
+    for i in range(1, len(seq)):
+        run = run + 1 if seq[i] == seq[i - 1] else 1
+        best = max(best, run)
+    return best / len(seq)
+
+
+def _switch_rate(seq: list) -> float:
+    if len(seq) < 2:
+        return 0.0
+    return sum(1 for i in range(1, len(seq)) if seq[i] != seq[i - 1]) / (len(seq) - 1)
+
+
+def _signature_features(hands: list[dict]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    n = len(hands)
+    if n == 0:
+        for name in ("action", "role", "street", "bucket"):
+            out[f"sig_{name}_top_share"] = 0.0
+            out[f"sig_{name}_unique_share"] = 0.0
+        for k in ("run_share", "switch_rate", "actor_switch"):
+            out[f"reg_{k}_mean"] = 0.0
+            out[f"reg_{k}_std"] = 0.0
+        out["high_aggr_hand_rate"] = 0.0
+        out["low_entropy_hand_rate"] = 0.0
+        out["zero_hero_action_rate"] = 0.0
+        return out
+
+    sigs = {"action": [], "role": [], "street": [], "bucket": []}
+    run_shares, switch_rates, actor_switches = [], [], []
+    n_high_aggr = n_low_ent = n_zero_hero = 0
+    for h in hands:
+        actions = [a for a in (h.get("actions") or []) if isinstance(a, dict)]
+        meta = h.get("metadata") or {}
+        hero = int(_f(meta.get("hero_seat")))
+        a_types = [str(a.get("action_type") or "") for a in actions]
+        roles = ["H" if int(_f(a.get("actor_seat"))) == hero and hero > 0 else "o"
+                 for a in actions]
+        streets = [str(a.get("street") or "") for a in actions]
+        buckets = [_bucket_idx(_f(a.get("normalized_amount_bb"))) for a in actions]
+        actors = [int(_f(a.get("actor_seat"))) for a in actions]
+        sigs["action"].append(tuple(a_types))
+        sigs["role"].append(tuple(roles))
+        sigs["street"].append(tuple(streets))
+        sigs["bucket"].append(tuple(buckets))
+        run_shares.append(_max_run_share(a_types))
+        switch_rates.append(_switch_rate(a_types))
+        actor_switches.append(_switch_rate(actors))
+        m = max(len(a_types), 1)
+        aggr = sum(1 for t in a_types if t in ("bet", "raise")) / m
+        ent = _entropy(Counter(a_types))
+        if aggr > 0.5:
+            n_high_aggr += 1
+        if ent < 0.3:
+            n_low_ent += 1
+        if not any(r == "H" for r in roles):
+            n_zero_hero += 1
+
+    for name in ("action", "role", "street", "bucket"):
+        c = Counter(sigs[name])
+        out[f"sig_{name}_top_share"] = max(c.values()) / n
+        out[f"sig_{name}_unique_share"] = len(c) / n
+    for k, series in (("run_share", run_shares), ("switch_rate", switch_rates),
+                      ("actor_switch", actor_switches)):
+        arr = np.asarray(series, dtype=float)
+        out[f"reg_{k}_mean"] = float(arr.mean())
+        out[f"reg_{k}_std"] = float(arr.std())
+    out["high_aggr_hand_rate"] = n_high_aggr / n
+    out["low_entropy_hand_rate"] = n_low_ent / n
+    out["zero_hero_action_rate"] = n_zero_hero / n
     return out
 
 
