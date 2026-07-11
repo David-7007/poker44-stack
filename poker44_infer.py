@@ -39,6 +39,7 @@ class StackPredictor:
             self.mono_model = art["mono_model"]
             self.mono_cols = np.asarray(art["mono_cols"], dtype=int)
             self.mlp_model = art["mlp_model"]
+            self.ranker_model = art.get("ranker_model")  # v7+; absent in v5/v6
             self.blend_weights = art["blend_weights"]
             self.models = {}
         else:
@@ -78,6 +79,11 @@ class StackPredictor:
                 out["mlp"] = self.mlp_model.predict_proba(X)[:, 1]
             except Exception:
                 pass
+            if self.ranker_model is not None:
+                try:  # LambdaMART: raw ranking score (rank-normalized in blend)
+                    out["ranker"] = self.ranker_model.predict(X)
+                except Exception:
+                    pass
             return out
         out = {}
         for name, model in self.models.items():
@@ -131,11 +137,18 @@ class StackPredictor:
     # exceeds 10%, so only high-confidence chunks may cross while the
     # ranking (AP / recall@FPR) stays intact.
     CROSS_CONFIDENCE = 0.80
-    # Floor on the crossing set: live-domain confidence collapses (measured
-    # 2026-07-09: 1/100 live chunks >= 0.80), and a window with zero true-bot
-    # hard positives scores 0 reward. The top 12% by rank are overwhelmingly
-    # bots for any usable ranking, keeping hard-FPR well under the 10% cliff.
-    GATE_MIN_FRACTION = 0.12
+    # Refined threshold gate (adopted from field leader uid 99 + our floor):
+    #  * FLOOR: our members are trained on SYNTHETIC bots and are under-confident
+    #    on real ones (measured: few live raw scores clear 0.5), so we still need
+    #    a minimum crossing set to avoid the zero-reward trap.
+    #  * CAP: never cross more than GATE_MAX_FRACTION, bounding hard-FPR@0.5.
+    #  * ELIGIBILITY: prefer to cross only chunks the ensemble already puts >0.5.
+    #  * THIN BAND: positives sit just above 0.5 (0.502..0.512) so an accidental
+    #    high-ranked human barely crosses; rank order (AP/recall) is preserved.
+    GATE_MIN_FRACTION = 0.10
+    GATE_MAX_FRACTION = 0.45
+    POS_BAND = (0.502, 0.512)
+    NEG_BAND = (0.02, 0.49)
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
@@ -152,31 +165,38 @@ class StackPredictor:
                 if sum(weights.values()) <= 0:
                     weights = {k: 1.0 for k in feats}
                 total = sum(weights.values())
+                # ordering: every member rank-normalized (ranker score is fine here)
                 ranked = sum(w * _rank(feats[k]) for k, w in weights.items()) / total
-                mean_prob = sum(w * feats[k] for k, w in weights.items()) / total
+                # eligibility confidence: probability members only (ranker is not
+                # a probability, so it must not enter the raw>0.5 test)
+                prob_keys = [k for k in feats if k != "ranker"]
+                pw = sum(weights[k] for k in prob_keys) or 1.0
+                mean_prob = sum(weights[k] * feats[k] for k in prob_keys) / pw
             else:
                 components = list(feats.values())
                 ranked = np.mean([_rank(c) for c in components], axis=0)
                 mean_prob = np.mean(components, axis=0)
 
-            # K = chunks confident enough to cross 0.5; crossing set is the
-            # top-K by rank so ordering is preserved exactly. Always cross at
-            # least the strongest chunk: zero hard positives => zero reward.
             import math
-            k = max(
-                1,
-                int(np.sum(mean_prob >= self.CROSS_CONFIDENCE)),
-                math.ceil(self.GATE_MIN_FRACTION * len(chunks)),
-            )
-            k = min(k, len(chunks))
+            n = len(chunks)
+            # crossing count K: eligibility (raw>0.5), clamped to [floor, cap]
+            eligible = int(np.sum(mean_prob > 0.5))
+            floor = math.ceil(self.GATE_MIN_FRACTION * n)
+            cap = int(math.floor(self.GATE_MAX_FRACTION * n))
+            k = max(1, min(cap if cap > 0 else 1, max(floor, eligible)))
+            k = min(k, n)
             order = np.argsort(-ranked, kind="stable")
-            final = np.empty(len(chunks))
-            n_low = max(len(chunks) - k, 1)
+            final = np.empty(n)
+            p_hi, p_lo = self.POS_BAND[1], self.POS_BAND[0]
+            n_hi, n_lo = self.NEG_BAND[1], self.NEG_BAND[0]
             for pos, idx in enumerate(order):
-                if pos < k:  # confident bots: 0.98 down to 0.55, monotone
-                    final[idx] = 0.98 - (0.43 * pos / max(k, 1))
-                else:  # everything else: 0.45 down to 0.02, monotone
-                    final[idx] = 0.45 - (0.43 * (pos - k) / n_low)
+                if pos < k:  # positives: thin band just above 0.5, rank-ordered
+                    t = pos / (k - 1) if k > 1 else 0.0
+                    final[idx] = p_hi - t * (p_hi - p_lo)
+                else:  # negatives: (0.02..0.49), rank-ordered
+                    lp = pos - k
+                    nn = max(n - k - 1, 1)
+                    final[idx] = n_hi - (lp / nn) * (n_hi - n_lo)
             return [float(round(s, 6)) for s in final]
         except Exception:
             return [0.5] * len(chunks)

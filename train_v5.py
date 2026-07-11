@@ -160,6 +160,22 @@ def fit_members(X, y, w, dates, tokens, scalars, hmask, amask, ys, train_idx=Non
     members["mlp"] = ("plain", mlp)
     print(f"m_mlp ({time.time()-t0:.0f}s)", flush=True)
 
+    # m_ranker: LambdaMART — directly optimizes rank order (the AP/recall reward
+    # is a ranking metric), grouped by release date. Adopted from field leader.
+    t0 = time.time()
+    tr_dates = dt
+    o = np.argsort(tr_dates, kind="stable")
+    Xr, yr, wr, dr = Xt[o], yt[o], wt[o], tr_dates[o]
+    _, counts = np.unique(dr, return_counts=True)
+    ranker = lgb.LGBMRanker(
+        objective="lambdarank", n_estimators=700, learning_rate=0.03,
+        num_leaves=31, min_child_samples=10, subsample=0.8, colsample_bytree=0.7,
+        reg_lambda=1.0, random_state=SEED, verbose=-1, n_jobs=12,
+        label_gain=list(range(max(2, int(yr.max()) + 1))))
+    ranker.fit(Xr, yr.astype(int), group=list(counts), sample_weight=wr)
+    members["ranker"] = ("ranker", ranker)
+    print(f"m_ranker: {len(counts)} date-groups ({time.time()-t0:.0f}s)", flush=True)
+
     seq_models = []
     reps = np.maximum(1, np.round(w).astype(int))
     pool = np.repeat(train_idx, reps[train_idx])
@@ -196,6 +212,7 @@ def member_scores(members, X, tokens, scalars, hmask, amask, idx):
     _, mxgb, cols = members["mono"]
     out["mono"] = mxgb.predict_proba(X[idx][:, cols])[:, 1]
     out["mlp"] = members["mlp"][1].predict_proba(X[idx])[:, 1]
+    out["ranker"] = members["ranker"][1].predict(X[idx])
     seqs = members["seq"][1]
     scores = np.zeros(len(idx))
     with torch.no_grad():
@@ -238,14 +255,14 @@ def main():
     ms = member_scores(wf_members, X, tokens, scalars, hmask, amask, hold)
     yh = y[hold]
 
-    names = ["stack", "mono", "mlp", "seq"]
+    names = ["stack", "mono", "mlp", "seq", "ranker"]
     for m in names:
         r = new_reward(yh, gated(rank01(ms[m])))
         print(f"  member {m}: wf reward={r:.4f} ap={average_precision_score(yh, ms[m]):.4f}", flush=True)
 
     best_w, best_r = None, -1
     grid = [0.0, 0.15, 0.25, 0.35, 0.5]
-    for combo in itertools.product(grid, repeat=4):
+    for combo in itertools.product(grid, repeat=len(names)):
         if sum(combo) == 0:
             continue
         blend = sum(c * rank01(ms[m]) for c, m in zip(combo, names)) / sum(combo)
@@ -253,6 +270,8 @@ def main():
         if r > best_r:
             best_r, best_w = r, combo
     print(f"walk-forward best weights {dict(zip(names, best_w))} reward={best_r:.4f}", flush=True)
+    for m in names:
+        print(f"  member {m}: wf reward={new_reward(yh, gated(rank01(ms[m]))):.4f}", flush=True)
 
     # ---- refit all members on ALL data, keep selected weights --------------
     members = fit_members(X, y, w, dates, tokens, scalars, hmask, amask, ys)
@@ -270,13 +289,14 @@ def main():
         "mono_model": members["mono"][1],
         "mono_cols": members["mono"][2],
         "mlp_model": members["mlp"][1],
+        "ranker_model": members["ranker"][1],
         "seq_states": seq_blobs,
         "seq_arch": {"d": 96},
         "blend_weights": dict(zip(names, best_w)),
         "metadata": {
             "trained_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             "n_groups": int(n),
-            "recipe": "blend-v5 walk-forward weighted (stack/mono/mlp/seq)",
+            "recipe": "blend-v7 walk-forward weighted (stack/mono/mlp/seq/ranker-lambdamart)",
             "wf_reward": float(best_r),
             "training_dates": ud,
         },
