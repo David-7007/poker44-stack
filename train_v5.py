@@ -273,6 +273,18 @@ def main():
     for m in names:
         print(f"  member {m}: wf reward={new_reward(yh, gated(rank01(ms[m]))):.4f}", flush=True)
 
+    # PRODUCTION WEIGHTS OVERRIDE: the walk-forward grid is computed on the
+    # saturated synthetic benchmark, where it reliably zeroes the LambdaMART
+    # ranker and mlp/mono (classifiers over-fit synthetic patterns and score
+    # higher offline) and over-weights the seq transformer. Those members carry
+    # the signal that transfers to REAL bots (ranker optimizes the rank reward
+    # directly; feature members use the signature/regularity families), so we
+    # deploy a deliberate diverse blend instead of the grid pick. Keep the grid
+    # print above for insight only.
+    prod = {"stack": 0.25, "mono": 0.15, "mlp": 0.15, "ranker": 0.30, "seq": 0.15}
+    best_w = tuple(prod.get(m, 0.0) for m in names)
+    print(f"PRODUCTION weights (override): {dict(zip(names, best_w))}", flush=True)
+
     # ---- refit all members on ALL data, keep selected weights --------------
     members = fit_members(X, y, w, dates, tokens, scalars, hmask, amask, ys)
 
